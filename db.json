@@ -84,6 +84,54 @@
 		"readme": "Returns a current status for your token. It utilizes the [Total.js Check API](https://docs.totaljs.com/totalapi/6c221003eo51c/#6d397001td51c).\n\n__Output data__:\n\n```js\n{\n    credits: 34.49\n}\n```"
 	},
 	{
+		"id": "checkfreespace",
+		"group": "Checks",
+		"name": "Check Free space",
+		"url": "https://cdn.totaljs.com/flowstream/webcomponents/checkfreespace.html",
+		"author": "Peter Širka | Total.js",
+		"icon": "ti ti-hdd",
+		"color": "",
+		"version": "1",
+		"kind": "",
+		"readme": "This component checks a freespace on HDD."
+	},
+	{
+		"id": "checklog",
+		"group": "Checks",
+		"name": "Check log",
+		"url": "https://cdn.totaljs.com/flowstream/webcomponents/checklog.html",
+		"author": "Peter Širka | Total.js",
+		"icon": "ti ti-bug",
+		"color": "",
+		"version": "1",
+		"kind": "",
+		"readme": "This component checks a file and tries to find a"
+	},
+	{
+		"id": "checkpg",
+		"group": "Checks",
+		"name": "Check PostgreSQL",
+		"url": "https://cdn.totaljs.com/flowstream/webcomponents/checkpg.html",
+		"author": "Peter Širka | Total.js",
+		"icon": "ti ti-database",
+		"color": "",
+		"version": "1",
+		"kind": "",
+		"readme": "This component checks PostgreSQL database connection."
+	},
+	{
+		"id": "checkurl",
+		"group": "Checks",
+		"name": "Check URL",
+		"url": "https://cdn.totaljs.com/flowstream/webcomponents/checkurl.html",
+		"author": "Peter Širka | Total.js",
+		"icon": "ti ti-globe",
+		"color": "",
+		"version": "1",
+		"kind": "",
+		"readme": "This component checks URL address."
+	},
+	{
 		"id": "tapicheckvatapi",
 		"group": "Total.js API Services",
 		"name": "Check VAT",
@@ -768,6 +816,18 @@
 		"readme": "## Input\n\nExpected data:\n\n```javascript\n{\n\tquery: 'SELECT * FROM tblname;'\n}\n```"
 	},
 	{
+		"id": "norepeat",
+		"group": "Checks",
+		"name": "No repeat",
+		"url": "https://cdn.totaljs.com/flowstream/webcomponents/norepeat.html",
+		"author": "Peter Širka | Total.js",
+		"icon": "ti ti-retweet",
+		"color": "",
+		"version": "1",
+		"kind": "",
+		"readme": "This component prevents the same content from being sent again in a short amount of time."
+	},
+	{
 		"id": "nosql",
 		"group": "Databases",
 		"name": "NoSQL",
@@ -1433,7 +1493,7 @@
 		"name": "XML parser",
 		"url": "https://cdn.totaljs.com/flowstream/webcomponents/xmlparser.html",
 		"author": "Total.js",
-		"icon": "fa fa-code",
+		"icon": "ti ti-code",
 		"color": "",
 		"version": "1",
 		"kind": "",
