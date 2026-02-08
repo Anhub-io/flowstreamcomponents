@@ -1,0 +1,260 @@
+<script total>
+	exports.id = 'wwebjs-status';
+	exports.name = 'WhatsApp-Web.js Status';
+	exports.icon = 'ti ti-whatsapp';
+	exports.author = 'Total.js';
+	exports.version = '3';
+	exports.group = 'Whatsapp';
+
+	exports.inputs = [{ id: 'input', name: 'Status' }];
+	exports.outputs = [];
+
+	exports.make = function(instance) {
+
+		instance.message = function($) {
+
+			var p = $.data || {};
+			var d = p.data || p;
+			var ts = p.timestamp || Date.now();
+
+			let stat = {
+				id: ts,
+				state: d.state || p.state || 'unknown',
+				message: d.message || '',
+				qr: d.qr || null,
+				qrFallback: d.qrFallback || null,
+				attempts: d.attempts,
+				maxAttempts: d.maxAttempts,
+				expiresIn: d.expiresIn,
+				percent: d.percent,
+				phone: d.phone,
+				platform: d.platform,
+				pushname: d.pushname,
+				connectionState: d.connectionState,
+				battery: d.battery,
+				plugged: d.plugged,
+				error: d.error,
+				type: d.type,
+				ackState: d.ackState,
+				messageId: d.messageId,
+				timestamp: new Date(ts)
+			};
+
+			console.log(stat);
+
+			instance.status(stat);
+		};
+	};
+</script>
+
+<style>
+	.CLASS {
+		--bg: #0e0f12;
+		--panel: #15171c;
+		--border: #23262e;
+		--text: #e5e7eb;
+		--muted: #9ca3af;
+
+		--success: #16a34a;
+		--error: #dc2626;
+		--info: #2563eb;
+		--warn: #f59e0b;
+		font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+		min-width: 350px;
+	}
+
+	.CLASS footer {
+		padding: 10px;
+	}
+
+	.CLASS .panel {
+		background: var(--panel);
+		border: 1px solid var(--border);
+		border-left: 4px solid var(--muted);
+		border-radius: 10px;
+		padding: 14px;
+		margin-bottom: 12px;
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+	}
+
+	.CLASS .panel.success { border-left-color: var(--success); }
+	.CLASS .panel.error   { border-left-color: var(--error); }
+	.CLASS .panel.info    { border-left-color: var(--info); }
+	.CLASS .panel.warn    { border-left-color: var(--warn); }
+	.CLASS .panel.unknown { border-left-color: var(--muted); }
+
+	.CLASS .title {
+		font-size: 13px;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: .4px;
+		display: flex;
+		align-items: center;
+		gap: 6px;
+	}
+
+	.CLASS .flag {
+		padding: 8px 10px;
+		border-radius: 6px;
+		font-size: 13px;
+		font-weight: 500;
+	}
+
+	.CLASS .flag.success { background: rgba(22,163,74,.15); color: var(--success); }
+	.CLASS .flag.error   { background: rgba(220,38,38,.15); color: var(--error); }
+	.CLASS .flag.info    { background: rgba(37,99,235,.15); color: var(--info); }
+	.CLASS .flag.warn    { background: rgba(245,158,11,.15); color: var(--warn); }
+	.CLASS .flag.muted   { background: rgba(156,163,175,.12); color: var(--muted); }
+
+	.CLASS .progress {
+		font-size: 13px;
+		color: var(--muted);
+	}
+
+	.CLASS .qr {
+		display: flex;
+		justify-content: center;
+		padding: 12px;
+		background: #fff;
+		border-radius: 8px;
+	}
+
+	.CLASS .qr img {
+		max-width: 220px;
+		height: auto;
+	}
+
+	.CLASS .qr-text {
+		font-family: monospace;
+		font-size: 11px;
+		color: #000;
+		word-break: break-all;
+	}
+
+	.CLASS .meta {
+		font-size: 12px;
+		color: var(--muted);
+	}
+
+	.CLASS .grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+		gap: 8px;
+	}
+
+	.CLASS .grid div {
+		background: rgba(255,255,255,.04);
+		padding: 8px;
+		border-radius: 6px;
+		font-size: 12px;
+	}
+
+	.CLASS .grid span {
+		display: block;
+		color: var(--muted);
+		font-size: 11px;
+	}
+
+	.CLASS .grid strong {
+		font-size: 13px;
+		font-weight: 600;
+	}
+
+	.CLASS .timestamp {
+		font-size: 11px;
+		color: var(--muted);
+		text-align: right;
+	}
+</style>
+
+<body>
+	<header>
+		<i class="$ICON"></i>$NAME
+	</header>
+
+	<footer>
+		<ui-bind path="STATUS" config="src:value.qr"></ui-bind>
+		<ui-bind path="STATUS" config="template:.panel -> data-id">
+			<script type="text/html">
+				{{ if value }}
+
+				<div class="panel {{ value.state || 'unknown' }}" data-id="{{ value.id }}">
+
+					<div class="title">
+						<i class="ti
+							{{ value.state === 'ready' ? 'ti-check' :
+							   value.state === 'authenticated' ? 'ti-lock' :
+							   value.state === 'qr-ready' ? 'ti-qrcode' :
+							   value.state === 'disconnected' ? 'ti-plug-off' :
+							   value.state === 'loading' ? 'ti-loader' :
+							   'ti-info-circle' }}">
+						</i>
+						{{ value.message || value.state || 'status' }}
+					</div>
+
+					{{ if value.state === 'qr-ready' && value.qr }}
+					<div class="meta">
+						{{ if value.attempts }}Attempt {{ value.attempts }}{{ fi }}
+						{{ if value.qr }}
+							<img
+							src="{{ value.qr }}"
+							alt="Description"
+							style="
+								width: 300px;
+								height: 300px;
+								object-fit: cover;
+								border: 2px solid #333;
+								border-radius: 8px;
+								display: block;
+							"
+						/>
+						{{ fi }}
+					</div>
+					{{ fi }}
+
+					{{ if value.state === 'loading' }}
+						<div class="progress">
+							Loading{{ if value.percent }} – {{ value.percent }}%{{ fi }}
+						</div>
+					{{ fi }}
+
+					{{ if value.state === 'authenticated' || value.state === 'ready' }}
+						<div class="flag success">Connected</div>
+					{{ fi }}
+
+					{{ if value.state === 'disconnected' || value.state === 'auth-failed' }}
+						<div class="flag error">Disconnected</div>
+					{{ fi }}
+
+					{{ if value.error }}
+						<div class="flag error">{{ value.error }}</div>
+					{{ fi }}
+
+					{{ if value.battery }}
+						<div class="meta">
+							Battery {{ value.battery }}%{{ if value.plugged }} (charging){{ fi }}
+						</div>
+					{{ fi }}
+
+					{{ if value.phone }}
+					<div class="grid">
+						<div><span>Phone</span><strong>{{ value.phone }}</strong></div>
+						<div><span>Platform</span><strong>{{ value.platform }}</strong></div>
+						<div><span>User</span><strong>{{ value.pushname }}</strong></div>
+						<div><span>Connection</span><strong>{{ value.connectionState }}</strong></div>
+					</div>
+					{{ fi }}
+
+					<div class="timestamp">
+						{{ value.timestamp | format('yyyy-MM-dd HH:mm:ss') }}
+					</div>
+
+				</div>
+
+				{{ fi }}
+			</script>
+		</ui-bind>
+	</footer>
+</body>

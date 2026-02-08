@@ -1,0 +1,1722 @@
+<script total>
+	exports.id = 'wwebjs';
+	exports.name = 'WhatsApp-Web.js';
+	exports.icon = 'ti ti-whatsapp';
+	exports.author = 'Total.js';
+	exports.version = '3';
+	exports.group = 'Whatsapp';
+	exports.config = {
+		phonenumber: '',
+		sendmedia: true,
+		autoinstall: false,
+		qrprovider: 'local',
+		sendseen: true,
+		sendtyping: true,
+		sendrecording: true,
+		downloadmedia: true,
+		usefilestorage: false,
+		antiban: true,
+		antiban_delay_min: 2000,
+		antiban_delay_max: 5000,
+		antiban_typing_duration: 3000,
+		reacttomessages: true,
+		webhook: '',
+		// Proxy settings
+		use_proxy: false,
+		proxy_server: '',
+		proxy_username: '',
+		proxy_password: '',
+		proxy_rotation: false,
+		proxy_list: ''
+	};
+	exports.inputs = [{ id: 'input', name: 'Send' }];
+	exports.outputs = [
+		{ id: 'output', name: 'Sent' },
+		{ id: 'received', name: 'Received' },
+		{ id: 'status', name: 'Status' },
+		{ id: 'error', name: 'Error' }
+	];
+	exports.npm = ['whatsapp-web.js', 'qrcode'];
+
+	exports.make = function(instance, config) {
+		var { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+		var QRCode = require('qrcode');
+		var client;
+		var ready = false;
+		var qrAttempts = 0;
+		var maxQrAttempts = 3;
+		var cfg;
+		var filestorage;
+		var proxyRotator;
+
+		var QR_PROVIDERS = {
+			google: 'https://chart.googleapis.com/chart?chs=300x300&cht=qr&chld=L|0&choe=UTF-8&chl={0}',
+			qrserver: 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={0}',
+			goqr: 'https://api.qr.io/v1/create?data={0}&size=300',
+			local: 'local'
+		};
+
+		// Proxy Rotation Manager
+		function ProxyRotator(proxyListString) {
+			this.proxyList = [];
+			this.currentIndex = 0;
+
+			if (proxyListString && proxyListString.trim()) {
+				this.proxyList = proxyListString.split('\n')
+					.map(function(p) { return p.trim(); })
+					.filter(function(p) { return p.length > 0; });
+			}
+
+			this.getNextProxy = function() {
+				if (this.proxyList.length === 0) return null;
+				var proxy = this.proxyList[this.currentIndex];
+				this.currentIndex = (this.currentIndex + 1) % this.proxyList.length;
+				return proxy;
+			};
+
+			this.hasProxies = function() {
+				return this.proxyList.length > 0;
+			};
+		}
+
+		// Anti-ban utilities
+		var antibanQueue = [];
+		var isProcessingQueue = false;
+
+		function randomDelay(min, max) {
+			return Math.floor(Math.random() * (max - min + 1)) + min;
+		}
+
+		function simulateTyping(chatId, duration) {
+			if (!cfg.antiban || !cfg.sendtyping) return Promise.resolve();
+
+			return client.sendStateTyping(chatId).then(function() {
+				return new Promise(function(resolve) {
+					setTimeout(resolve, duration);
+				});
+			}).catch(function(err) {
+				console.error('Typing simulation failed:', err);
+			});
+		}
+
+		function addToQueue(fn) {
+			return new Promise(function(resolve, reject) {
+				antibanQueue.push({ fn: fn, resolve: resolve, reject: reject });
+				processQueue();
+			});
+		}
+
+		function processQueue() {
+			if (isProcessingQueue || antibanQueue.length === 0) return;
+
+			isProcessingQueue = true;
+			var item = antibanQueue.shift();
+
+			var delay = cfg.antiban ? randomDelay(cfg.antiban_delay_min, cfg.antiban_delay_max) : 0;
+
+			setTimeout(function() {
+				item.fn().then(item.resolve).catch(item.reject).finally(function() {
+					isProcessingQueue = false;
+					processQueue();
+				});
+			}, delay);
+		}
+
+		function updateStatus(state, data) {
+			instance.status(data || { state: state });
+			var msg = instance.newmessage();
+			msg.data = { state: state, timestamp: Date.now(), data: data, phone: cfg.phonenumber };
+			msg.send('status');
+		}
+
+		function installDependencies() {
+			if (!cfg.autoinstall)
+				return;
+
+			var deps = [
+				'gconf-service', 'libasound2', 'libatk1.0-0', 'libc6', 'libcairo2',
+				'libcups2', 'libdbus-1-3', 'libexpat1', 'libfontconfig1', 'libgcc1',
+				'libgconf-2-4', 'libgdk-pixbuf2.0-0', 'libglib2.0-0', 'libgtk-3-0',
+				'libnspr4', 'libpango-1.0-0', 'libpangocairo-1.0-0', 'libstdc++6',
+				'libx11-6', 'libx11-xcb1', 'libxcb1', 'libxcomposite1', 'libxcursor1',
+				'libxdamage1', 'libxext6', 'libxfixes3', 'libxi6', 'libxrandr2',
+				'libxrender1', 'libxss1', 'libxtst6', 'ca-certificates',
+				'fonts-liberation', 'libappindicator1', 'libnss3', 'lsb-release',
+				'xdg-utils', 'wget', 'libgbm-dev'
+			];
+
+			updateStatus('checking-deps', { message: 'Checking system dependencies...' });
+
+			require('child_process').exec('which apt-get', function(err, stdout) {
+				if (err || !stdout) {
+					updateStatus('deps-warning', { message: 'apt-get not found, skipping dependency check' });
+					return;
+				}
+
+				var cmd = 'apt-get update && apt-get install -y ' + deps.join(' ');
+				require('child_process').exec(cmd, { timeout: 60000 }, function(err, stdout, stderr) {
+					if (err) {
+						updateStatus('deps-error', { message: 'Failed to install dependencies. Run manually as root.', error: stderr });
+					} else {
+						updateStatus('deps-installed', { message: 'Dependencies installed successfully' });
+					}
+				});
+			});
+		}
+
+		// Proxy configuration helper
+		function getProxyConfig() {
+			if (!cfg.use_proxy) return null;
+
+			var proxyServer;
+
+			// Use rotation if enabled and proxy list provided
+			if (cfg.proxy_rotation && proxyRotator && proxyRotator.hasProxies()) {
+				proxyServer = proxyRotator.getNextProxy();
+				updateStatus('proxy-rotated', {
+					message: 'Using rotated proxy',
+					proxy: proxyServer.replace(/\/\/[^@]+@/, '//***@') // Hide credentials in logs
+				});
+			} else if (cfg.proxy_server) {
+				proxyServer = cfg.proxy_server;
+			} else {
+				return null;
+			}
+
+			return {
+				server: proxyServer,
+				username: cfg.proxy_username,
+				password: cfg.proxy_password
+			};
+		}
+
+		// Build Puppeteer args with proxy
+		function buildPuppeteerArgs() {
+			var args = [
+				'--no-sandbox',
+				'--disable-setuid-sandbox',
+				'--disable-dev-shm-usage',
+				'--disable-accelerated-2d-canvas',
+				'--disable-gpu',
+				'--no-zygote'
+			];
+
+			var proxyConfig = getProxyConfig();
+			if (proxyConfig && proxyConfig.server) {
+				args.push('--proxy-server=' + proxyConfig.server);
+				updateStatus('proxy-configured', {
+					message: 'Proxy server configured',
+					proxy: proxyConfig.server.replace(/\/\/[^@]+@/, '//***@')
+				});
+			}
+
+			return args;
+		}
+
+		// File storage handler
+		function initFileStorage() {
+			if (!cfg.usefilestorage || !cfg.phonenumber) return;
+
+			try {
+				filestorage = FILESTORAGE(cfg.phonenumber);
+			} catch(e) {
+				console.error('FileStorage init failed:', e);
+				updateStatus('filestorage-error', { message: 'FileStorage initialization failed: ' + e.message });
+			}
+		}
+
+		function saveToFileStorage(data, callback) {
+			if (!cfg.usefilestorage || !filestorage) {
+				callback({ error: 'FileStorage not enabled' });
+				return;
+			}
+
+			var base64Data = data.content.indexOf(',') > -1 ? data.content.split(',')[1] : data.content;
+			var buffer = Buffer.from(base64Data, 'base64');
+			var uid = UID();
+			var filename = uid + data.ext;
+
+			filestorage.save(uid, filename, buffer, function(err, meta) {
+				if (err) {
+					callback({ error: err.message || err });
+					return;
+				}
+
+				meta.url = '/download/{0}/{1}.{2}'.format(cfg.phonenumber, meta.id.sign(CONF.salt), meta.ext);
+				callback(null, meta);
+			});
+		}
+
+		function getExtFromMimetype(mimetype) {
+			var map = {
+				'image/jpeg': 'jpg',
+				'image/jpg': 'jpg',
+				'image/png': 'png',
+				'image/gif': 'gif',
+				'image/webp': 'webp',
+				'video/mp4': 'mp4',
+				'video/3gpp': '3gp',
+				'video/quicktime': 'mov',
+				'audio/ogg': 'ogg',
+				'audio/mpeg': 'mp3',
+				'audio/mp4': 'm4a',
+				'audio/aac': 'aac',
+				'application/pdf': 'pdf',
+				'application/msword': 'doc',
+				'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+				'application/vnd.ms-excel': 'xls',
+				'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+				'application/zip': 'zip',
+				'text/plain': 'txt'
+			};
+
+			if (mimetype && mimetype.indexOf('codecs=opus') > -1)
+				return 'ogg';
+
+			return map[mimetype] || 'bin';
+		}
+
+		function getMessageType(whatsappType) {
+			var typeMap = {
+				'chat': 'text',
+				'image': 'image',
+				'video': 'video',
+				'audio': 'audio',
+				'ptt': 'voice',
+				'document': 'document',
+				'sticker': 'sticker',
+				'location': 'location',
+				'vcard': 'contact',
+				'multi_vcard': 'contacts'
+			};
+			return typeMap[whatsappType] || 'media';
+		}
+
+		// Enhanced message handler
+		async function handleIncomingMessage(message) {
+			try {
+				// Handle status updates separately
+				if (message.isStatus) {
+					await handleStatus(message);
+					return;
+				}
+
+				// Send seen if enabled
+				if (cfg.sendseen) {
+					var chat = await message.getChat();
+					chat.sendSeen().catch(function(err) {
+						console.error('Send seen failed:', err);
+					});
+				}
+
+				// Determine message context
+				var chatid = message.from;
+				var chat = await message.getChat();
+				var contact = await message.getContact();
+				var number = message.from.split('@')[0];
+				var isgroup = chat.isGroup;
+				var mentions = await message.getMentions() || [];
+				var istag = false;
+				var forme = false;
+
+				// Check if bot was mentioned
+				for (var m of mentions) {
+					if (m.isMe) istag = true;
+				}
+
+				// Check quoted messages
+				var quotedMsg = null;
+				if (message.hasQuotedMsg) {
+					try {
+						var qm = await message.getQuotedMessage();
+						if (qm.fromMe) forme = true;
+						quotedMsg = qm.body || '';
+					} catch(e) {
+						console.error('Error getting quoted message:', e);
+					}
+				}
+
+				if (isgroup && message.hasQuotedMsg && forme) istag = true;
+
+				// Build user object
+				var user = {
+					id: isgroup ? message.author : message.from,
+					name: contact.name || '',
+					pushname: contact.pushname || '',
+					shortname: contact.shortname || '',
+					number: contact.number || '',
+					isBusiness: contact.isBusiness || false
+				};
+
+				// Get country code safely
+				try {
+					user.countrycode = await contact.getCountryCode();
+				} catch(e) {
+					user.countrycode = '';
+				}
+
+				// Build group object
+				var group = {
+					name: isgroup ? chat.name : '',
+					id: isgroup ? chatid : '',
+					isGroup: isgroup
+				};
+
+				// Handle different message types
+				if (message.hasMedia) {
+					await handleMediaMessage(message, number, chatid, isgroup, istag, user, group, quotedMsg);
+				} else if (message.type === 'chat') {
+					await handleTextMessage(message, number, chatid, isgroup, istag, user, group, quotedMsg);
+				} else if (message.type === 'location') {
+					await handleLocationMessage(message, number, chatid, isgroup, istag, user, group);
+				} else if (message.type === 'vcard' || message.type === 'multi_vcard') {
+					await handleContactMessage(message, number, chatid, isgroup, istag, user, group);
+				}
+
+			} catch(err) {
+				console.error('Message handling error:', err);
+				var msg = instance.newmessage();
+				msg.data = { error: err.message, rawError: err.toString(), stack: err.stack };
+				msg.send('error');
+			}
+		}
+
+		async function handleTextMessage(message, number, chatid, isgroup, istag, user, group, quotedMsg) {
+			var body = message.body;
+
+			if (quotedMsg && quotedMsg.length > 0) {
+				var quoted = quotedMsg.length > 2200 ? quotedMsg.substring(0, 2200) + '...' : quotedMsg;
+				body = '"{0}"\n\n{1}'.format(quoted, body);
+			}
+
+			// Send typing indicator
+			if ((isgroup && istag) || !isgroup) {
+				if (cfg.sendtyping) {
+					try {
+						var chat = await message.getChat();
+						await chat.sendStateTyping();
+					} catch(e) {
+						console.error('Typing state failed:', e);
+					}
+				}
+			}
+
+			sendReceivedMessage({
+				type: 'text',
+				content: body,
+				number: number,
+				chatid: chatid,
+				isgroup: isgroup,
+				istag: istag,
+				user: user,
+				group: group,
+				messageId: message.id._serialized,
+				timestamp: message.timestamp,
+				fromMe: message.fromMe,
+				hasQuotedMsg: message.hasQuotedMsg,
+				quotedMsg: quotedMsg,
+				isForwarded: message.isForwarded,
+				broadcast: message.broadcast
+			});
+		}
+
+		async function handleMediaMessage(message, number, chatid, isgroup, istag, user, group, quotedMsg) {
+			if (!cfg.downloadmedia) {
+				sendReceivedMessage({
+					type: 'media_notification',
+					content: 'Media received but download disabled',
+					number: number,
+					chatid: chatid,
+					isgroup: isgroup,
+					istag: istag,
+					user: user,
+					group: group,
+					hasMedia: true,
+					mediaType: message.type,
+					messageId: message.id._serialized,
+					timestamp: message.timestamp
+				});
+				return;
+			}
+
+			// Send recording indicator for voice messages
+			if (message.type === 'ptt' || message.type === 'audio') {
+				if ((isgroup && istag) || !isgroup) {
+					if (cfg.sendrecording) {
+						try {
+							var chat = await message.getChat();
+							await chat.sendStateRecording();
+						} catch(e) {
+							console.error('Recording state failed:', e);
+						}
+					}
+				}
+			}
+
+			try {
+				var media = await message.downloadMedia();
+				var mimetype = media.mimetype;
+				var ext = '.' + (media.filename ? media.filename.split('.').pop() : getExtFromMimetype(mimetype));
+
+				if (cfg.usefilestorage) {
+					// Save to file storage
+					saveToFileStorage({ content: 'data:' + mimetype + ';base64,' + media.data, ext: ext }, function(err, fileData) {
+						if (err) {
+							sendReceivedMessage({
+								type: 'media_error',
+								error: err.error || err,
+								number: number,
+								chatid: chatid,
+								messageId: message.id._serialized
+							});
+							return;
+						}
+
+						sendReceivedMessage({
+							type: getMessageType(message.type),
+							content: fileData.url,
+							fileData: fileData,
+							number: number,
+							chatid: chatid,
+							isgroup: isgroup,
+							istag: istag,
+							user: user,
+							group: group,
+							messageId: message.id._serialized,
+							timestamp: message.timestamp,
+							caption: message.body || '',
+							mimetype: mimetype,
+							filename: media.filename || 'file' + ext,
+							quotedMsg: quotedMsg,
+							isForwarded: message.isForwarded
+						});
+					});
+				} else {
+					// Return base64
+					sendReceivedMessage({
+						type: getMessageType(message.type),
+						content: 'data:' + mimetype + ';base64,' + media.data,
+						number: number,
+						chatid: chatid,
+						isgroup: isgroup,
+						istag: istag,
+						user: user,
+						group: group,
+						messageId: message.id._serialized,
+						timestamp: message.timestamp,
+						caption: message.body || '',
+						mimetype: mimetype,
+						filename: media.filename || 'file' + ext,
+						quotedMsg: quotedMsg,
+						isForwarded: message.isForwarded
+					});
+				}
+			} catch(err) {
+				console.error('Media download failed:', err);
+				sendReceivedMessage({
+					type: 'media_error',
+					error: err.message || err.toString(),
+					number: number,
+					chatid: chatid,
+					messageId: message.id._serialized
+				});
+			}
+		}
+
+		async function handleLocationMessage(message, number, chatid, isgroup, istag, user, group) {
+			var location = message.location;
+			sendReceivedMessage({
+				type: 'location',
+				content: location,
+				number: number,
+				chatid: chatid,
+				isgroup: isgroup,
+				istag: istag,
+				user: user,
+				group: group,
+				messageId: message.id._serialized,
+				timestamp: message.timestamp,
+				latitude: location.latitude,
+				longitude: location.longitude,
+				description: location.description || ''
+			});
+		}
+
+		async function handleContactMessage(message, number, chatid, isgroup, istag, user, group) {
+			try {
+				var contacts = await message.getContacts();
+				sendReceivedMessage({
+					type: message.type === 'multi_vcard' ? 'contacts' : 'contact',
+					content: contacts,
+					number: number,
+					chatid: chatid,
+					isgroup: isgroup,
+					istag: istag,
+					user: user,
+					group: group,
+					messageId: message.id._serialized,
+					timestamp: message.timestamp,
+					contacts: contacts.map(function(c) {
+						return {
+							id: c.id._serialized,
+							name: c.name,
+							number: c.number,
+							pushname: c.pushname
+						};
+					})
+				});
+			} catch(e) {
+				console.error('Contact parsing failed:', e);
+			}
+		}
+
+		async function handleStatus(message) {
+			var data = {
+				type: 'status',
+				body: message.body || '',
+				caption: message.caption || '',
+				timestamp: message.timestamp,
+				from: message.from,
+				messageId: message.id._serialized
+			};
+
+			if (message.hasMedia && cfg.downloadmedia) {
+				try {
+					var media = await message.downloadMedia();
+					if (cfg.usefilestorage) {
+						var ext = '.' + getExtFromMimetype(media.mimetype);
+						saveToFileStorage({ content: 'data:' + media.mimetype + ';base64,' + media.data, ext: ext }, function(err, fileData) {
+							if (!err) {
+								data.media = {
+									url: fileData.url,
+									mimetype: media.mimetype,
+									filename: media.filename
+								};
+							}
+							var msg = instance.newmessage();
+							msg.data = data;
+							msg.send('status');
+						});
+						return;
+					} else {
+						data.media = {
+							mimetype: media.mimetype,
+							data: media.data,
+							filename: media.filename
+						};
+					}
+				} catch(e) {
+					console.error('Status media download failed:', e);
+				}
+			}
+
+			var msg = instance.newmessage();
+			msg.data = data;
+			msg.send('status');
+		}
+
+		function sendReceivedMessage(data) {
+			var msg = instance.newmessage();
+			msg.data = data;
+			msg.send('received');
+
+			// Webhook if configured
+			if (cfg.webhook) {
+				RESTBuilder.POST(cfg.webhook, { type: 'message', data: data }).callback(function(err) {
+					if (err) console.error('Webhook failed:', err);
+				});
+			}
+		}
+
+		instance.message = function($) {
+			var data = $.data;
+
+			if (!ready) {
+				$.send('error', { error: 'Client not ready', state: 'not_ready' });
+				return;
+			}
+
+			if (!data || !data.number) {
+				$.send('error', { error: 'Missing number', state: 'invalid_input' });
+				return;
+			}
+
+			// Format number
+			var number = data.number.toString().replace(/[^0-9]/g, '');
+			if (!number.includes('@')) {
+				number = number + '@c.us';
+			}
+
+			// Handle actions
+			if (data.action) {
+				handleAction($, data, number);
+				return;
+			}
+
+			// Send message with anti-ban
+			if (cfg.antiban) {
+				addToQueue(function() {
+					return sendMessageWithAntiBan($, data, number);
+				});
+			} else {
+				sendMessageWithAntiBan($, data, number);
+			}
+		};
+
+		async function sendMessageWithAntiBan($, data, number) {
+			try {
+				// Simulate typing
+				if (cfg.antiban && data.message && cfg.sendtyping) {
+					var typingDuration = Math.min(data.message.length * 50, cfg.antiban_typing_duration);
+					await simulateTyping(number, typingDuration);
+				}
+
+				// Send actual message
+				if (cfg.sendmedia && data.media) {
+					await sendMediaMessage($, data, number);
+				} else {
+					await sendTextMessage($, data, number);
+				}
+			} catch(err) {
+				$.send('error', { error: err.message || err, state: 'send_failed' });
+			}
+		}
+
+		function sendTextMessage($, data, number) {
+			if (!data.message) {
+				$.send('error', { error: 'Missing message', state: 'invalid_input' });
+				return Promise.reject(new Error('Missing message'));
+			}
+
+			var options = {};
+			if (data.quotedMessageId) {
+				options.quotedMessageId = data.quotedMessageId;
+			}
+
+			return client.sendMessage(number, data.message, options).then(function(response) {
+				$.send('output', {
+					success: true,
+					messageId: response.id._serialized,
+					timestamp: response.timestamp,
+					to: number
+				});
+			}).catch(function(err) {
+				$.send('error', { error: err.message || err, state: 'send_failed' });
+				throw err;
+			});
+		}
+
+		function sendMediaMessage($, data, number) {
+			if (!data.media || (!data.media.url && !data.media.base64)) {
+				$.send('error', { error: 'Missing media URL or base64', state: 'invalid_input' });
+				return Promise.reject(new Error('Missing media'));
+			}
+
+			var promise;
+			if (data.media.base64) {
+				promise = Promise.resolve(new MessageMedia(
+					data.media.mimetype || 'image/jpeg',
+					data.media.base64,
+					data.media.filename || 'file'
+				));
+			} else {
+				promise = MessageMedia.fromUrl(data.media.url);
+			}
+
+			return promise.then(function(media) {
+				if (data.media.mimetype) media.mimetype = data.media.mimetype;
+				if (data.media.filename) media.filename = data.media.filename;
+
+				var options = { caption: data.message || data.caption || '' };
+				if (data.quotedMessageId) options.quotedMessageId = data.quotedMessageId;
+
+				return client.sendMessage(number, media, options);
+			}).then(function(response) {
+				$.send('output', {
+					success: true,
+					messageId: response.id._serialized,
+					timestamp: response.timestamp,
+					to: number,
+					type: 'media'
+				});
+			}).catch(function(err) {
+				$.send('error', { error: err.message || err, state: 'media_send_failed' });
+				throw err;
+			});
+		}
+
+		function handleAction($, data, number) {
+			var actions = {
+				'react': function() {
+					if (!cfg.reacttomessages) {
+						return Promise.reject(new Error('React to messages is disabled'));
+					}
+					if (!data.messageId || !data.reaction) {
+						return Promise.reject(new Error('Missing messageId or reaction'));
+					}
+					return client.sendMessage(number, data.reaction, {
+						quotedMessageId: data.messageId,
+						reaction: data.reaction
+					});
+				},
+				'typing': function() {
+					return client.sendStateTyping(number);
+				},
+				'recording': function() {
+					return client.sendStateRecording(number);
+				},
+				'read': function() {
+					return client.getChatById(number).then(function(chat) {
+						return chat.sendSeen();
+					});
+				},
+				'chatinfo': function() {
+					return client.getChatById(number).then(function(chat) {
+						return {
+							id: chat.id._serialized,
+							name: chat.name,
+							isGroup: chat.isGroup,
+							unreadCount: chat.unreadCount,
+							timestamp: chat.timestamp,
+							archived: chat.archived,
+							pinned: chat.pinned,
+							isMuted: chat.isMuted
+						};
+					});
+				},
+				'contactinfo': function() {
+					return client.getContactById(number).then(function(contact) {
+						return {
+							id: contact.id._serialized,
+							number: contact.number,
+							pushname: contact.pushname,
+							name: contact.name,
+							isMyContact: contact.isMyContact,
+							isBlocked: contact.isBlocked,
+							isWAContact: contact.isWAContact,
+							isBusiness: contact.isBusiness
+						};
+					});
+				}
+			};
+
+			var actionFn = actions[data.action];
+			if (!actionFn) {
+				$.send('error', { error: 'Unknown action: ' + data.action, state: 'invalid_action' });
+				return;
+			}
+
+			actionFn().then(function(result) {
+				$.send('output', { success: true, action: data.action, result: result });
+			}).catch(function(err) {
+				$.send('error', { error: err.message || err, state: data.action + '_failed' });
+			});
+		}
+
+		instance.close = function() {
+			if (client) {
+				updateStatus('closing', { message: 'Closing WhatsApp client...' });
+				client.destroy().catch(function(err) {
+					console.error('Error destroying client:', err);
+				});
+			}
+		};
+
+		instance.configure = function() {
+			cfg = instance.replace(config);
+
+			if (!cfg.phonenumber) {
+				updateStatus('error', { message: 'Phone number is required for multi-session support' });
+				instance.status({ state: 'error', message: 'Phone number required' });
+				return;
+			}
+
+			if (client) {
+				client.destroy().catch(function() {});
+			}
+
+			ready = false;
+			qrAttempts = 0;
+			antibanQueue = [];
+			isProcessingQueue = false;
+
+			// Initialize proxy rotator if rotation enabled
+			if (cfg.use_proxy && cfg.proxy_rotation && cfg.proxy_list) {
+				proxyRotator = new ProxyRotator(cfg.proxy_list);
+				updateStatus('proxy-rotation-enabled', {
+					message: 'Proxy rotation enabled',
+					proxies: proxyRotator.proxyList.length
+				});
+			}
+
+			updateStatus('initializing', { message: 'Initializing WhatsApp client for ' + cfg.phonenumber });
+
+			// Install dependencies if enabled
+			installDependencies();
+
+			// Initialize file storage
+			initFileStorage();
+
+			// Build puppeteer configuration with proxy support
+			var puppeteerConfig = {
+				headless: true,
+				args: buildPuppeteerArgs(),
+				ignoreHTTPSErrors: true
+			};
+
+			// Create client with phone-specific auth
+			client = new Client({
+				authStrategy: new LocalAuth({
+					clientId: cfg.phonenumber,
+					dataPath: './.wwebjs_auth/' + cfg.phonenumber
+				}),
+				puppeteer: puppeteerConfig
+			});
+
+			// Add proxy authentication if configured
+			var proxyConfig = getProxyConfig();
+			if (proxyConfig && proxyConfig.username && proxyConfig.password) {
+				client.on('puppeteer_page', async function(page) {
+					try {
+						var proxyAuth = Buffer.from(
+							proxyConfig.username + ':' + proxyConfig.password
+						).toString('base64');
+
+						await page.setExtraHTTPHeaders({
+							'Proxy-Authorization': 'Basic ' + proxyAuth
+						});
+
+						updateStatus('proxy-auth-set', {
+							message: 'Proxy authentication configured'
+						});
+					} catch(err) {
+						console.error('Failed to set proxy auth:', err);
+						updateStatus('proxy-auth-error', {
+							message: 'Failed to set proxy authentication: ' + err.message
+						});
+					}
+				});
+			}
+
+			// QR Code event
+			client.on('qr', function(qr) {
+				qrAttempts++;
+
+				if (qrAttempts > maxQrAttempts) {
+					updateStatus('qr-expired', {
+						message: 'QR code expired. Restart component to generate new code.',
+						attempts: qrAttempts,
+						phone: cfg.phonenumber
+					});
+					return;
+				}
+
+				if (cfg.qrprovider === 'local') {
+					QRCode.toDataURL(qr, { width: 300, margin: 2 }, function(err, dataUrl) {
+						if (err) {
+							updateStatus('qr-error', { message: 'QR generation failed: ' + err.message });
+							return;
+						}
+						var status = {
+							state: 'qr-ready',
+							message: 'Scan QR code with WhatsApp',
+							qr: dataUrl,
+							qrFallback: dataUrl,
+							attempts: qrAttempts,
+							maxAttempts: maxQrAttempts,
+							expiresIn: 60,
+							phone: cfg.phonenumber,
+							proxyEnabled: cfg.use_proxy
+						};
+						instance.status(status);
+						updateStatus('qr-ready', status);
+					});
+				} else {
+					var qrUrl = QR_PROVIDERS[cfg.qrprovider].format(encodeURIComponent(qr));
+					QRCode.toDataURL(qr, { width: 300, margin: 2 }, function(err, dataUrl) {
+						var status = {
+							state: 'qr-ready',
+							message: 'Scan QR code with WhatsApp',
+							qr: qrUrl,
+							qrFallback: err ? qrUrl : dataUrl,
+							attempts: qrAttempts,
+							maxAttempts: maxQrAttempts,
+							expiresIn: 60,
+							phone: cfg.phonenumber,
+							proxyEnabled: cfg.use_proxy
+						};
+						instance.status(status);
+						updateStatus('qr-ready', status);
+					});
+				}
+			});
+
+			// Loading session
+			client.on('loading_screen', function(percent, message) {
+				updateStatus('loading', {
+					message: 'Loading: ' + message,
+					percent: percent,
+					phone: cfg.phonenumber
+				});
+			});
+
+			// Authenticated event
+			client.on('authenticated', function() {
+				updateStatus('authenticated', {
+					message: 'Authentication successful',
+					phone: cfg.phonenumber,
+					proxyEnabled: cfg.use_proxy
+				});
+			});
+
+			// Authentication failure
+			client.on('auth_failure', function(msg) {
+				updateStatus('auth-failed', {
+					message: 'Authentication failed: ' + msg,
+					action: 'Please scan QR code again',
+					phone: cfg.phonenumber,
+					proxyEnabled: cfg.use_proxy
+				});
+			});
+
+			// Ready event
+			client.on('ready', function() {
+				ready = true;
+
+				client.getState().then(function(state) {
+					return client.info;
+				}).then(function(info) {
+					var status = {
+						state: 'ready',
+						message: 'WhatsApp connected',
+						phone: info.wid.user,
+						platform: info.platform,
+						pushname: info.pushname,
+						configuredPhone: cfg.phonenumber,
+						proxyEnabled: cfg.use_proxy,
+						antiBanEnabled: cfg.antiban
+					};
+
+					instance.status(status);
+					updateStatus('ready', status);
+				}).catch(function(err) {
+					console.error('Error getting client info:', err);
+					updateStatus('ready', {
+						state: 'ready',
+						message: 'WhatsApp connected',
+						phone: cfg.phonenumber,
+						proxyEnabled: cfg.use_proxy
+					});
+				});
+			});
+
+			// Disconnected event
+			client.on('disconnected', function(reason) {
+				ready = false;
+				updateStatus('disconnected', {
+					message: 'Disconnected: ' + reason,
+					reason: reason,
+					action: 'Component will attempt to reconnect',
+					phone: cfg.phonenumber
+				});
+			});
+
+			// Change state event
+			client.on('change_state', function(state) {
+				updateStatus('state-change', {
+					message: 'State changed to: ' + state,
+					state: state,
+					phone: cfg.phonenumber
+				});
+			});
+
+			// Battery info
+			client.on('change_battery', function(batteryInfo) {
+				instance.status({
+					battery: batteryInfo.battery,
+					plugged: batteryInfo.plugged,
+					phone: cfg.phonenumber
+				});
+			});
+
+			// Incoming messages
+			client.on('message', handleIncomingMessage);
+
+			// Message creation (sent messages)
+			client.on('message_create', function(message) {
+				if (message.fromMe) {
+					instance.status({
+						lastSent: message.body ? message.body.substring(0, 50) : '[Media]',
+						lastSentTime: new Date(message.timestamp * 1000).toLocaleTimeString(),
+						phone: cfg.phonenumber
+					});
+				}
+			});
+
+			// Message acknowledgement
+			client.on('message_ack', function(message, ack) {
+				var ackStates = ['error', 'pending', 'server', 'device', 'read', 'played'];
+				var msg = instance.newmessage();
+				msg.data = {
+					messageId: message.id._serialized,
+					ack: ack,
+					ackState: ackStates[ack] || 'unknown',
+					timestamp: Date.now(),
+					phone: cfg.phonenumber
+				};
+				msg.send('status');
+			});
+
+			// Message revoke
+			client.on('message_revoke_everyone', function(message, revokedMessage) {
+				var msg = instance.newmessage();
+				msg.data = {
+					type: 'message_revoked',
+					messageId: message.id._serialized,
+					revokedBy: message.from,
+					timestamp: Date.now(),
+					phone: cfg.phonenumber
+				};
+				msg.send('status');
+			});
+
+			// Group join event
+			client.on('group_join', function(notification) {
+				var msg = instance.newmessage();
+				msg.data = {
+					type: 'group_join',
+					chatId: notification.chatId,
+					author: notification.author,
+					recipientIds: notification.recipientIds,
+					timestamp: notification.timestamp,
+					phone: cfg.phonenumber
+				};
+				msg.send('status');
+			});
+
+			// Group leave event
+			client.on('group_leave', function(notification) {
+				var msg = instance.newmessage();
+				msg.data = {
+					type: 'group_leave',
+					chatId: notification.chatId,
+					author: notification.author,
+					recipientIds: notification.recipientIds,
+					timestamp: notification.timestamp,
+					phone: cfg.phonenumber
+				};
+				msg.send('status');
+			});
+
+			// Initialize client
+			client.initialize().catch(function(err) {
+				updateStatus('init-error', {
+					message: 'Initialization failed: ' + err.message,
+					error: err.message,
+					action: 'Check logs and restart component',
+					phone: cfg.phonenumber,
+					proxyEnabled: cfg.use_proxy
+				});
+			});
+		};
+
+		instance.configure();
+	};
+
+	// Register file download route
+	exports.install = function() {
+		ROUTE('FILE /download/{phone}/*.*', function() {
+			var $ = this;
+			var phone = $.params.phone;
+			var index = $.params[0].lastIndexOf('.');
+
+			if (index !== -1) {
+				var hash = $.params[0].substring(0, index);
+				var id = hash.substring(0, hash.indexOf('-', 10));
+
+				if (hash === id.sign(CONF.salt)) {
+					try {
+						var fs = FILESTORAGE(phone);
+						fs.read(id, function(err, meta, stream) {
+							if (err) {
+								$.throw404();
+								return;
+							}
+							$.stream(stream, meta.type);
+						});
+					} catch(e) {
+						console.error('FileStorage read error:', e);
+						$.throw404();
+					}
+					return;
+				}
+			}
+			$.throw404();
+		});
+	};
+</script>
+<readme>
+# WhatsApp Web Enhanced
+
+Advanced WhatsApp client with multi-account support, intelligent anti-ban strategies, residential proxy support with rotation, and flexible file handling.
+
+## Key Features
+
+### 1. Multi-Account Support
+- Each component instance maintains separate session based on phone number
+- Sessions stored in `.wwebjs_auth/{phonenumber}/`
+- Multiple WhatsApp accounts can run simultaneously on the same server
+
+### 2. Residential Proxy Support
+Avoid IP-based rate limiting and bot detection with comprehensive proxy features:
+- **Single Proxy Mode**: Use one residential proxy for all connections
+- **Proxy Rotation**: Automatically rotate through multiple proxies to distribute load
+- **Proxy Authentication**: Full support for username/password authentication
+- **Automatic Failover**: Seamlessly switches to next available proxy on failure
+- **Connection Monitoring**: Real-time proxy status tracking
+
+### 3. Anti-Ban Strategies
+When enabled, the component implements human-like behavior:
+- **Random delays** between messages (configurable 2-5 seconds)
+- **Typing simulation** before sending (duration based on message length)
+- **Message queuing** to prevent rapid-fire sending
+- **Recording indicators** for voice messages
+- **Natural behavior patterns** mimicking human interaction
+
+### 4. Flexible File Handling
+- **Base64 mode** (default): Returns media as base64 strings for immediate use
+- **FileStorage mode**: Saves files to Total.js FileStorage with cryptographically signed download URLs
+- Automatic route registration for secure file downloads at `/download/{phone}/*.*`
+
+### 5. Enhanced Message Processing
+Comprehensive message handling with detailed metadata:
+```js
+{
+  type: 'text|image|video|voice|audio|document|sticker|location|contact',
+  content: 'message or file URL/base64',
+  number: '1234567890',
+  chatid: '1234567890@c.us',
+  isgroup: false,
+  istag: false,
+  user: {
+    id: 'user_id',
+    name: 'Contact Name',
+    pushname: 'Push Name',
+    shortname: 'Short',
+    number: '1234567890',
+    countrycode: '1',
+    isBusiness: false
+  },
+  group: {
+    name: 'Group Name',
+    id: 'group_id@g.us',
+    isGroup: true
+  },
+  messageId: 'message_id_serialized',
+  timestamp: 1234567890,
+  fromMe: false,
+  caption: 'Media caption',
+  quotedMsg: 'Quoted message text',
+  hasQuotedMsg: true,
+  isForwarded: false,
+  broadcast: false,
+  mimetype: 'image/jpeg',
+  filename: 'photo.jpg'
+}
+```
+
+## Configuration
+
+### Required Settings
+- **Phone Number**: Your WhatsApp number (used for multi-session management and session identification)
+
+### Proxy Settings
+- **Use Proxy**: Enable residential proxy support
+- **Proxy Server**: Single proxy URL (e.g., `http://proxy.example.com:8080` or `http://user:pass@proxy.example.com:8080`)
+- **Proxy Username**: Authentication username (optional if credentials not in URL)
+- **Proxy Password**: Authentication password (optional if credentials not in URL)
+- **Enable Proxy Rotation**: Automatically rotate through multiple proxies
+- **Proxy List**: Multiple proxy URLs (one per line) for rotation
+
+### Anti-Ban Settings
+- **Enable Anti-Ban**: Activates intelligent sending delays and human-like behavior
+- **Min Delay**: Minimum delay between messages (default: 2000ms)
+- **Max Delay**: Maximum delay between messages (default: 5000ms)
+- **Typing Duration**: Maximum typing simulation time (default: 3000ms)
+
+### File Handling
+- **Use FileStorage**: Enable to save files to Total.js FileStorage instead of base64
+- **Download Media**: Automatically download incoming media files
+
+### Behavior Settings
+- **Send Seen**: Mark messages as read automatically
+- **Send Typing**: Show typing indicator when processing
+- **Send Recording**: Show recording indicator for voice messages
+- **React to Messages**: Enable message reactions support
+
+### Additional Options
+- **Send Media**: Enable media sending capability
+- **QR Provider**: Choose QR code generation method (Local, Google Charts, QR Server, GoQR)
+- **Auto Install**: Automatically install system dependencies (Linux only)
+- **Webhook URL**: POST received messages to external webhook endpoint
+
+## Proxy Configuration Examples
+
+### Single Proxy Setup
+```
+Use Proxy: ✓
+Proxy Server: http://residential-proxy.example.com:8080
+Proxy Username: user123
+Proxy Password: pass123
+```
+
+### Proxy with Embedded Credentials
+```
+Use Proxy: ✓
+Proxy Server: http://user123:pass123@residential-proxy.example.com:8080
+```
+
+### Proxy Rotation Setup
+```
+Use Proxy: ✓
+Enable Proxy Rotation: ✓
+Proxy List:
+http://proxy1.example.com:8080
+http://user:pass@proxy2.example.com:8080
+http://proxy3.example.com:8080
+Proxy Username: user123
+Proxy Password: pass123
+```
+
+## Anti-Ban Best Practices
+
+The component implements research-backed strategies for WhatsApp automation:
+
+1. **Humanized Timing**: Random delays between actions prevent detection patterns
+2. **Typing Indicators**: Shows natural "composing" state before sending
+3. **Queue Management**: Prevents burst sending that triggers rate limits
+4. **Session Persistence**: Maintains long-term authentication to avoid frequent re-auth
+5. **Proxy Rotation**: Distributes requests across multiple IPs to avoid IP-based blocking
+6. **State Simulation**: Uses typing/recording states appropriately for different message types
+
+## Usage Examples
+
+### Send Text Message with Anti-Ban
+```js
+{
+  number: "1234567890",
+  message: "Hello! How are you today?"
+}
+```
+Component automatically adds delays and typing simulation if anti-ban is enabled.
+
+### Send Media from URL
+```js
+{
+  number: "1234567890",
+  message: "Check out this photo!",
+  media: {
+    url: "https://example.com/photo.jpg",
+    mimetype: "image/jpeg",
+    filename: "vacation.jpg"
+  }
+}
+```
+
+### Send Media from Base64
+```js
+{
+  number: "1234567890",
+  caption: "My document",
+  media: {
+    base64: "base64_encoded_data_here",
+    mimetype: "application/pdf",
+    filename: "document.pdf"
+  }
+}
+```
+
+### Reply to Message
+```js
+{
+  number: "1234567890",
+  message: "Thanks for your message!",
+  quotedMessageId: "message_id_to_quote"
+}
+```
+
+### Multiple Accounts
+Create multiple component instances with different phone numbers to run separate WhatsApp accounts simultaneously. Each maintains independent sessions and configurations.
+
+## Proxy Benefits
+
+### Why Use Residential Proxies?
+1. **Avoid Rate Limiting**: Distribute requests across multiple IPs
+2. **Prevent IP Bans**: Reduce risk of WhatsApp blocking your server IP
+3. **Anti-Bot Detection**: Residential IPs appear as regular users to WhatsApp
+4. **Geographic Distribution**: Better performance and reliability for international users
+5. **Load Distribution**: Automatic failover ensures continuous operation
+
+### Recommended Proxy Characteristics
+- High-quality residential proxy networks (not datacenter proxies)
+- Rotating IP pools with large inventory
+- HTTP/HTTPS CONNECT method support
+- Authentication support (username/password)
+- Low latency connections (less then 500ms)
+- High uptime guarantees (99%+)
+
+## File Download Route
+
+When FileStorage is enabled, media files are accessible at:
+```
+/download/{phonenumber}/{signed_id}.{ext}
+```
+
+The route is automatically registered during component installation and secured with cryptographically signed IDs to prevent unauthorized access.
+
+## Advanced Actions
+
+The component supports various actions beyond message sending:
+
+### Available Actions
+- `react`: Send reaction to a message (requires `reacttomessages` enabled)
+- `typing`: Show typing indicator
+- `recording`: Show recording indicator
+- `read`: Mark chat as read
+- `chatinfo`: Get detailed chat information
+- `contactinfo`: Get detailed contact information
+
+### Action Examples
+
+**React to Message:**
+```js
+{
+  number: "1234567890",
+  action: "react",
+  messageId: "message_id_to_react_to",
+  reaction: "👍"
+}
+```
+
+**Get Chat Info:**
+```js
+{
+  number: "1234567890",
+  action: "chatinfo"
+}
+```
+
+**Get Contact Info:**
+```js
+{
+  number: "1234567890@c.us",
+  action: "contactinfo"
+}
+```
+
+## Status Updates
+
+The component emits comprehensive status updates through the `status` output:
+
+- **QR Code States**: `qr-ready`, `qr-expired`, `qr-error`
+- **Connection States**: `initializing`, `loading`, `authenticated`, `ready`, `disconnected`
+- **Proxy States**: `proxy-configured`, `proxy-rotated`, `proxy-auth-set`
+- **Dependency States**: `checking-deps`, `deps-installed`, `deps-error`
+- **Error States**: `auth-failed`, `init-error`, `filestorage-error`
+
+All status updates include relevant metadata like phone number, timestamp, and proxy information.
+
+## Message Events
+
+The component emits events for various message-related activities:
+
+- **message**: Incoming messages (output: `received`)
+- **message_create**: Sent messages (status updates)
+- **message_ack**: Delivery acknowledgements (states: error, pending, server, device, read, played)
+- **message_revoke_everyone**: Deleted messages
+- **group_join**: User joins group
+- **group_leave**: User leaves group
+- **change_battery**: Battery status updates
+
+## Error Handling
+
+Comprehensive error handling for:
+- Proxy connection failures with automatic rotation
+- Authentication errors with clear messaging
+- Network timeouts and retries
+- WhatsApp disconnections with reconnect attempts
+- Media download failures
+- File storage errors
+- Invalid input validation
+
+All errors are sent to the `error` output with detailed information.
+
+## Performance Considerations
+
+### With Proxy Rotation
+- Slight latency increase (50-200ms) due to proxy routing
+- Improved long-term reliability through failover
+- Better stability under high load
+- Reduced risk of IP-based blocking
+
+### Recommended Settings for Production
+
+**Conservative (High Safety):**
+```
+Enable Anti-Ban: ✓
+Enable Proxy Rotation: ✓
+Use at least 5-10 proxies
+Min Delay: 30000ms (30 seconds)
+Max Delay: 180000ms (3 minutes)
+Typing Duration: 5000ms
+```
+
+**Moderate (Balanced):**
+```
+Enable Anti-Ban: ✓
+Enable Proxy Rotation: ✓
+Use at least 3-5 proxies
+Min Delay: 10000ms (10 seconds)
+Max Delay: 60000ms (1 minute)
+Typing Duration: 3000ms
+```
+
+**Testing (Low Safety):**
+```
+Enable Anti-Ban: ✓
+Enable Proxy Rotation: Optional
+Use 1-2 proxies
+Min Delay: 2000ms
+Max Delay: 5000ms
+Typing Duration: 2000ms
+```
+
+## Security Notes
+
+- Proxy credentials are stored in component configuration (use environment variables for sensitive data)
+- Keep proxy passwords secure and rotate regularly
+- Use HTTPS proxies when possible for encrypted traffic
+- Regularly rotate proxy credentials to maintain security
+- Monitor proxy usage for anomalies and unauthorized access
+- File download URLs are cryptographically signed and expire
+- Session files contain authentication data - protect `.wwebjs_auth/` directory
+
+## Troubleshooting
+
+### Proxy Connection Issues
+1. Verify proxy URL format: `http://host:port` or `http://user:pass@host:port`
+2. Check proxy authentication credentials are correct
+3. Ensure proxy supports HTTP CONNECT method for WebSocket
+4. Test proxy connectivity outside component using curl or similar
+5. Check firewall rules allow outbound connections to proxy
+6. Verify proxy supports the required ports (typically 80, 443, 8080)
+
+### QR Code Not Generating
+1. Check proxy connectivity if proxy is enabled
+2. Try disabling proxy temporarily to isolate issue
+3. Verify phone number is configured correctly
+4. Check component logs for initialization errors
+5. Ensure puppeteer dependencies are installed (Linux)
+6. Try different QR provider in settings
+
+### Rate Limiting Despite Proxies
+1. Increase delay between messages (min 30s recommended for production)
+2. Add more proxies to rotation pool (5-10 recommended)
+3. Reduce overall message frequency and volume
+4. Enable all anti-ban features
+5. Check if proxies are flagged (try different proxy provider)
+
+### Messages Not Sending
+1. Verify client is in `ready` state
+2. Check number format includes country code
+3. Ensure anti-ban queue isn't overwhelmed (check status)
+4. Verify media URLs are accessible if sending media
+5. Check for authentication issues (QR code may need rescan)
+
+### FileStorage Not Working
+1. Ensure Total.js FILESTORAGE is configured in application
+2. Verify phone number is set correctly
+3. Check file permissions on storage directory
+4. Review component logs for FileStorage errors
+
+## System Requirements
+
+### Linux Dependencies (Auto-installed if enabled)
+The component can automatically install required dependencies on Debian/Ubuntu systems:
+- gconf-service, libasound2, libatk1.0-0, libcairo2, libcups2
+- libdbus-1-3, libexpat1, libfontconfig1, libgcc1, libgdk-pixbuf2.0-0
+- libglib2.0-0, libgtk-3-0, libnspr4, libpango-1.0-0, libx11-6
+- libxcomposite1, libxcursor1, libxdamage1, libxext6, libxfixes3
+- fonts-liberation, libappindicator1, libnss3, libgbm-dev
+- And more...
+
+Enable "Auto Install" in settings to automatically install on first run (requires root/sudo).
+
+## Notes
+
+- Phone number must match your WhatsApp account for session management
+- Anti-ban enabled by default - disable only for testing environments
+- FileStorage requires Total.js FILESTORAGE configuration in application
+- Each phone number maintains completely independent session data
+- QR code regenerates up to 3 times before requiring component restart
+- Proxy rotation requires at least 2 proxy URLs for effectiveness
+- Residential proxies strongly recommended over datacenter proxies
+- Component automatically handles WhatsApp protocol updates via whatsapp-web.js
+
+## Webhook Integration
+
+Configure a webhook URL to receive all incoming messages in real-time:
+
+Webhook payload format:
+```js
+{
+  type: 'message',
+  data: {
+    // Full message data object as shown above
+  }
+}
+```
+
+Messages are automatically POSTed to your webhook endpoint. Failed webhook calls are logged but don't affect message processing.
+
+</readme>
+<settings>
+  <div class="padding bg-smoke">
+    <h3 class="nmt"><i class="ti ti-phone"></i> Account Configuration</h3>
+    <div class="m">
+      <ui-component name="input" path="?.phonenumber" config="required:1;placeholder:e.g., 1234567890">Phone Number (Required)</ui-component>
+      <div class="help">Your WhatsApp phone number with country code (without + symbol). Used for multi-session identification.</div>
+    </div>
+  </div>
+
+  <div class="padding">
+    <h3><i class="ti ti-network"></i> Proxy Configuration</h3>
+    <div class="m">
+      <ui-component name="input" path="?.use_proxy" config="type:checkbox">Enable Proxy</ui-component>
+      <div class="help">Use residential proxies to avoid IP-based rate limiting and bot detection. Highly recommended for production.</div>
+    </div>
+
+    <div data-bind="?.use_proxy__show" class="hidden">
+      <div class="m">
+        <ui-component name="input" path="?.proxy_server" config="placeholder:http://proxy.example.com:8080">Proxy Server</ui-component>
+        <div class="help">Single proxy URL (used when rotation is disabled). Format: http://host:port or http://user:pass@host:port</div>
+      </div>
+
+      <div class="row">
+        <div class="col-md-6 m">
+          <ui-component name="input" path="?.proxy_username" config="placeholder:Username (optional)">Proxy Username</ui-component>
+          <div class="help">Optional if credentials are in proxy URL</div>
+        </div>
+        <div class="col-md-6 m">
+          <ui-component name="input" path="?.proxy_password" config="type:password;placeholder:Password (optional)">Proxy Password</ui-component>
+          <div class="help">Optional if credentials are in proxy URL</div>
+        </div>
+      </div>
+
+      <div class="m">
+        <ui-component name="input" path="?.proxy_rotation" config="type:checkbox">Enable Proxy Rotation</ui-component>
+        <div class="help">Automatically rotate through multiple proxies for better reliability and load distribution</div>
+      </div>
+
+      <div data-bind="?.proxy_rotation__show" class="hidden m">
+        <ui-component name="input" path="?.proxy_list" config="type:multiline;rows:6;placeholder:http://proxy1.example.com:8080&#10;http://user:pass@proxy2.example.com:8080&#10;http://proxy3.example.com:8080">Proxy List (one per line)</ui-component>
+        <div class="help">Multiple proxy URLs for rotation. One proxy per line. Requires at least 2 proxies for effective rotation.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="padding bg-smoke">
+    <h3><i class="ti ti-shield-check"></i> Anti-Ban Protection</h3>
+    <div class="m">
+      <ui-component name="input" path="?.antiban" config="type:checkbox">Enable Anti-Ban Strategies</ui-component>
+      <div class="help">Implements humanized delays, typing simulation, and message queuing to prevent detection. Recommended for all production use.</div>
+    </div>
+    <div class="row">
+      <div class="col-md-4 m">
+        <ui-component name="input" path="?.antiban_delay_min" config="type:number;increment:1000;min:0">Min Delay (ms)</ui-component>
+        <div class="help">Minimum delay between messages</div>
+      </div>
+      <div class="col-md-4 m">
+        <ui-component name="input" path="?.antiban_delay_max" config="type:number;increment:1000;min:0">Max Delay (ms)</ui-component>
+        <div class="help">Maximum delay between messages</div>
+      </div>
+      <div class="col-md-4 m">
+        <ui-component name="input" path="?.antiban_typing_duration" config="type:number;increment:500;min:0">Max Typing Duration (ms)</ui-component>
+        <div class="help">Maximum typing indicator duration</div>
+      </div>
+    </div>
+    <div class="help"><strong>Recommended for Production:</strong> Min: 30000ms (30s), Max: 180000ms (3min), Typing: 5000ms</div>
+  </div>
+
+  <div class="padding">
+    <h3><i class="ti ti-file"></i> File Handling</h3>
+    <div class="row">
+      <div class="col-md-6 m">
+        <ui-component name="input" path="?.usefilestorage" config="type:checkbox">Use FileStorage</ui-component>
+        <div class="help">Save media to Total.js FileStorage with signed URLs instead of returning base64</div>
+      </div>
+      <div class="col-md-6 m">
+        <ui-component name="input" path="?.downloadmedia" config="type:checkbox">Download Media</ui-component>
+        <div class="help">Automatically download incoming media files</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="padding bg-smoke">
+    <h3><i class="ti ti-settings"></i> Behavior Settings</h3>
+    <div class="row">
+      <div class="col-md-3 m">
+        <ui-component name="input" path="?.sendseen" config="type:checkbox">Send Seen</ui-component>
+        <div class="help">Mark messages as read</div>
+      </div>
+      <div class="col-md-3 m">
+        <ui-component name="input" path="?.sendtyping" config="type:checkbox">Send Typing</ui-component>
+        <div class="help">Show typing indicator</div>
+      </div>
+      <div class="col-md-3 m">
+        <ui-component name="input" path="?.sendrecording" config="type:checkbox">Send Recording</ui-component>
+        <div class="help">Show recording indicator</div>
+      </div>
+      <div class="col-md-3 m">
+        <ui-component name="input" path="?.reacttomessages" config="type:checkbox">React to Messages</ui-component>
+        <div class="help">Enable message reactions</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="padding">
+    <h3><i class="ti ti-adjustments"></i> Additional Settings</h3>
+    <div class="m">
+      <ui-component name="input" path="?.sendmedia" config="type:checkbox">Enable Media Sending</ui-component>
+      <div class="help">Allow sending images, videos, documents, and other media</div>
+    </div>
+    <div class="m">
+      <ui-component name="input" path="?.qrprovider" config="dirsource:local|Local Generation,google|Google Charts,qrserver|QR Server,goqr|GoQR">QR Code Provider</ui-component>
+      <div class="help">Choose how QR codes are generated. Local generation is most reliable.</div>
+    </div>
+    <div class="m">
+      <ui-component name="input" path="?.autoinstall" config="type:checkbox">Auto Install Dependencies</ui-component>
+      <div class="help">Automatically install required system dependencies on Linux (requires root/sudo). Only runs on first initialization.</div>
+    </div>
+    <div class="m">
+      <ui-component name="input" path="?.webhook" config="placeholder:https://your-webhook-url.com/webhook">Webhook URL (Optional)</ui-component>
+      <div class="help">POST all received messages to this external webhook endpoint in real-time</div>
+    </div>
+  </div>
+
+  <div class="padding bg-smoke">
+    <div class="help">
+      <strong>Quick Setup Tips:</strong><br>
+      • <strong>Testing:</strong> Enable Anti-Ban with 2-5s delays, single proxy optional<br>
+      • <strong>Production:</strong> Enable Anti-Ban with 30-180s delays, proxy rotation with 5+ proxies recommended<br>
+      • <strong>Proxy Format:</strong> http://host:port or http://user:pass@host:port<br>
+      • <strong>FileStorage:</strong> Requires Total.js FILESTORAGE configuration in your application<br>
+      • <strong>Multi-Account:</strong> Create separate component instances with different phone numbers
+    </div>
+  </div>
+</settings>
+<body>
+	<header>
+		<i class="$ICON"></i>$NAME
+	</header>
+</body>
